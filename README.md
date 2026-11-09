@@ -251,7 +251,7 @@ def generate_rag_answer(question, top_chunks):
 
     # حالت اول: اگر کلید Gemini وارد شده باشد
     if GEMINI_API_KEY:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={GEMINI_API_KEY}"
         payload = json.dumps({
             "contents": [{"parts": [{"text": prompt}]}]
         }).encode('utf-8')
