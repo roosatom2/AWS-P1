@@ -16,8 +16,9 @@
 8. [مرحله ۵: IAM](#-مرحله-۵-iam)
 9. [مرحله ۶: وب‌هوک تلگرام](#-مرحله-۶-وبهوک-تلگرام)
 10. [مرحله ۷: کد نهایی](#-مرحله-۷-کد-نهایی)
-11. [نحوه کار RAG در این پروژه](#-نحوه-کار-rag-در-این-پروژه)
-12. [نکات و بهبودها](#-نکات-و-بهبودها)
+11. [مرحله ۸: خواندن مستقیم PDF از S3](#-مرحله-۸-خواندن-مستقیم-pdf-از-s3)
+12. [نحوه کار RAG در این پروژه](#-نحوه-کار-rag-در-این-پروژه)
+13. [نکات و بهبودها](#-نکات-و-بهبودها)
 
 ---
 
@@ -29,6 +30,7 @@
 | **S3** | نگه‌داری فایل جزوه‌ها (`course_chunks.json`) |
 | **Lambda + Function URL** | دریافت پیام از تلگرام، جست‌وجو در جزوه و تولید پاسخ |
 | **IAM** | مجوز خواندن از S3 برای تابع |
+| **CloudShell و Layer** | ساخت لایه `pypdf` برای خواندن مستقیم PDF (مرحله ۸) |
 | **Gemini یا OpenRouter** | مدل زبانی که پاسخ نهایی را می‌نویسد |
 
 ---
@@ -113,7 +115,7 @@ sequenceDiagram
 ]
 ```
 
-> کد، فیلدهای `source`، `page` و `content` را می‌خواند.
+> کد، فیلدهای `source`، `page` و `content` را می‌خواند. اگر مرحله ۸ را انجام دهید، دیگر به این فایل نیازی نیست و می‌توانید PDFها را مستقیم آپلود کنید.
 
 ---
 
@@ -251,7 +253,7 @@ def generate_rag_answer(question, top_chunks):
 
     # حالت اول: اگر کلید Gemini وارد شده باشد
     if GEMINI_API_KEY:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={GEMINI_API_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
         payload = json.dumps({
             "contents": [{"parts": [{"text": prompt}]}]
         }).encode('utf-8')
@@ -310,11 +312,217 @@ def lambda_handler(event, context):
 
 ---
 
+## 📄 مرحله ۸: خواندن مستقیم PDF از S3
+
+در این مرحله نیازی به ساخت `course_chunks.json` نیست. Lambda خودش فایل‌های PDF را از Bucket می‌خواند و متن هر صفحه را استخراج می‌کند. کتابخانه `pypdf` در Lambda پیش‌فرض نیست، پس آن را با **CloudShell** در یک **Layer** می‌سازیم.
+
+### تفاوت با نسخه قبلی
+
+| مورد | نسخه قبلی | نسخه جدید |
+|---|---|---|
+| ورودی | فایل آماده `course_chunks.json` | خود فایل‌های PDF |
+| استخراج متن | بیرون از AWS و قبل از آپلود | داخل Lambda با `pypdf` |
+| کتابخانه اضافه | ندارد | لایه `pypdf-layer` |
+| بارگذاری | یک فایل JSON | همه PDFهای Bucket |
+
+### دیاگرام نسخه جدید
+
+```mermaid
+flowchart LR
+    U["👤 دانشجو"]
+    TG["✈️ تلگرام"]
+
+    subgraph AWS["☁️ AWS"]
+        LMB["⚡ Lambda<br/>TelegramCourseRAG"]
+        LAYER["📦 لایه pypdf-layer"]
+        S3[("🪣 S3 Bucket<br/>فایل‌های PDF")]
+        CACHE["🧠 قطعه‌ها در حافظه<br/>(cache)"]
+    end
+
+    LLM["🧠 مدل زبانی"]
+
+    U -->|"سوال"| TG
+    TG -->|"Webhook"| LMB
+    LAYER -.->|"کتابخانه"| LMB
+    LMB -->|"۱. دانلود PDFها (فقط بار اول)"| S3
+    LMB -->|"۲. استخراج متن هر صفحه"| CACHE
+    CACHE -->|"۳. چهار قطعه برتر"| LMB
+    LMB -->|"۴. پرامپت"| LLM
+    LLM -->|"۵. پاسخ"| LMB
+    LMB -->|"۶. sendMessage"| TG
+```
+
+### قدم اول: ساخت Layer در CloudShell
+
+1. در بالای کنسول AWS، کنار نوار جست‌وجو، روی آیکون **CloudShell** (مربع با علامت `>_`) کلیک کنید.
+2. چند ثانیه صبر کنید تا ترمینال بالا بیاید.
+3. دستورها را خط به خط کپی و اجرا کنید:
+
+```bash
+mkdir -p python/lib/python3.12/site-packages
+pip install pypdf -t python/lib/python3.12/site-packages/
+zip -r pypdf_layer.zip python
+aws lambda publish-layer-version --layer-name pypdf-layer --zip-file fileb://pypdf_layer.zip --compatible-runtimes python3.12
+```
+
+4. خروجی یک متن JSON است که نشان می‌دهد Layer ساخته شده. بعد از آن CloudShell را ببندید.
+
+> CloudShell و تابع Lambda باید در یک Region باشند، وگرنه Layer در لیست Lambda دیده نمی‌شود.
+
+### قدم دوم: اتصال Layer به تابع
+
+1. به صفحه تابع `TelegramCourseRAG` برگردید.
+2. در تب **Code** به انتهای صفحه، بخش **Layers**، بروید و **Add a layer** را بزنید.
+3. گزینه **Custom layers** را انتخاب کنید.
+4. از منوی کشویی `pypdf-layer` و نسخه `1` را انتخاب کنید.
+5. روی **Add** کلیک کنید.
+
+### قدم سوم: آپلود PDF و تغییر کد
+
+1. فایل‌های جزوه (با پسوند `.pdf`) را مستقیم در Bucket (در این پروژه `cloud-tel`) آپلود کنید. فایل‌های قبلی را می‌توانید پاک کنید.
+2. مطمئن شوید مقدار `S3_BUCKET_NAME` در Environment variables همان نام Bucket است.
+3. کد قبلی را با کد زیر جایگزین و **Deploy** کنید.
+
+```python
+import json
+import os
+import re
+import urllib.request
+import boto3
+import io
+from pypdf import PdfReader
+
+s3_client = boto3.client('s3')
+
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
+BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')
+
+cached_chunks = None
+
+def send_telegram_message(chat_id, text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = json.dumps({"chat_id": chat_id, "text": text}).encode('utf-8')
+    req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
+    urllib.request.urlopen(req, timeout=10)
+
+def load_pdfs_from_s3():
+    global cached_chunks
+    if cached_chunks is not None:
+        return cached_chunks
+
+    cached_chunks = []
+
+    # گرفتن لیست تمام فایل‌های داخل باکت
+    response = s3_client.list_objects_v2(Bucket=BUCKET_NAME)
+    if 'Contents' not in response:
+        return []
+
+    for obj in response['Contents']:
+        file_key = obj['Key']
+
+        # فقط پردازش فایل‌هایی که پسوند pdf دارند
+        if file_key.lower().endswith('.pdf'):
+            # دانلود فایل PDF در حافظه موقت RAM (بدون نیاز به ذخیره روی هارد)
+            pdf_obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=file_key)
+            pdf_bytes = io.BytesIO(pdf_obj['Body'].read())
+
+            # خواندن صفحات PDF
+            reader = PdfReader(pdf_bytes)
+            for page_num, page in enumerate(reader.pages):
+                text = page.extract_text()
+                if text and len(text.strip()) > 50:
+                    cached_chunks.append({
+                        "source": file_key,
+                        "page": page_num + 1,
+                        "content": text.strip()
+                    })
+
+    return cached_chunks
+
+def tokenize(text):
+    return set(re.findall(r'\w+', text.lower()))
+
+def retrieve_top_k(question, k=4):
+    chunks = load_pdfs_from_s3()
+    q_words = tokenize(question)
+
+    scored_chunks = []
+    for chunk in chunks:
+        c_words = tokenize(chunk['content'])
+        overlap = len(q_words.intersection(c_words))
+        scored_chunks.append((overlap, chunk))
+
+    scored_chunks.sort(key=lambda x: x[0], reverse=True)
+    return [item[1] for item in scored_chunks[:k]]
+
+def generate_rag_answer(question, top_chunks):
+    if not top_chunks:
+        return "هیچ فایل PDF یا متن مرتبطی در باکت S3 پیدا نشد."
+
+    context_text = "\n\n---\n\n".join(
+        [f"منبع: فایل {c['source']} (صفحه {c['page']}):\n{c['content']}" for c in top_chunks]
+    )
+
+    prompt = (
+        f"شما دستیار هوشمند درس رایانش ابری هستید. بر اساس «متن جزوه» زیر به «سوال دانشجو» به زبان فارسی دقیق پاسخ دهید. "
+        f"در انتهای پاسخ، نام فایل و شماره صفحه‌ای که جواب را از آن استخراج کردید ذکر کنید.\n\n"
+        f"متن جزوه:\n{context_text}\n\n"
+        f"سوال دانشجو: {question}"
+    )
+
+    if GEMINI_API_KEY:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={GEMINI_API_KEY}"
+        payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode('utf-8')
+        req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=25) as res:
+            result = json.loads(res.read().decode('utf-8'))
+            return result['candidates'][0]['content']['parts'][0]['text']
+
+    elif OPENROUTER_API_KEY:
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        payload = json.dumps({"model": "google/gemini-2.5-flash", "messages": [{"role": "user", "content": prompt}]}).encode('utf-8')
+        headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {OPENROUTER_API_KEY}'}
+        req = urllib.request.Request(url, data=payload, headers=headers)
+        with urllib.request.urlopen(req, timeout=25) as res:
+            result = json.loads(res.read().decode('utf-8'))
+            return result['choices'][0]['message']['content']
+
+    else:
+        return "خطا: لطفاً متغیر GEMINI_API_KEY یا OPENROUTER_API_KEY را ثبت کنید."
+
+def lambda_handler(event, context):
+    try:
+        body = json.loads(event.get('body', '{}'))
+        if 'message' not in body or 'text' not in body['message']:
+            return {'statusCode': 200, 'body': 'OK'}
+
+        chat_id = body['message']['chat']['id']
+        user_text = body['message']['text'].strip()
+
+        if user_text == '/start':
+            send_telegram_message(chat_id, "سلام! من دستیار ابری درس هستم. در حال خواندن زنده PDFهای شما از باکت S3 هستم. سوالتان را بپرسید!")
+            return {'statusCode': 200, 'body': 'OK'}
+
+        top_chunks = retrieve_top_k(user_text, k=4)
+        answer = generate_rag_answer(user_text, top_chunks)
+        send_telegram_message(chat_id, answer)
+
+        return {'statusCode': 200, 'body': 'OK'}
+
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return {'statusCode': 200, 'body': 'Error handled'}
+```
+
+---
+
 ## 🔍 نحوه کار RAG در این پروژه
 
 | مرحله | توضیح |
 |---|---|
-| **بارگذاری** | فایل `course_chunks.json` یک بار از S3 خوانده و در متغیر سراسری نگه داشته می‌شود تا درخواست‌های بعدی سریع‌تر باشند |
+| **بارگذاری** | فایل `course_chunks.json` (یا در نسخه مرحله ۸، همه PDFهای Bucket) یک بار خوانده و در متغیر سراسری نگه داشته می‌شود تا درخواست‌های بعدی سریع‌تر باشند |
 | **بازیابی** | سوال و هر قطعه به مجموعه کلمات تبدیل می‌شوند و تعداد کلمات مشترک، امتیاز قطعه است |
 | **انتخاب** | چهار قطعه با بیشترین امتیاز انتخاب می‌شوند |
 | **تولید** | قطعه‌ها، نام فایل و شماره صفحه همراه سوال در یک پرامپت فارسی به مدل داده می‌شوند |
@@ -330,3 +538,8 @@ def lambda_handler(event, context):
 - **کلیدها:** کلید مدل زبانی در متغیر محیطی ذخیره شده است. برای پروژه جدی‌تر، AWS Secrets Manager گزینه امن‌تری است.
 - **سقف پیام تلگرام:** هر پیام حداکثر حدود ۴۰۹۶ کاراکتر می‌تواند باشد. پاسخ‌های خیلی بلند باید به چند پیام تقسیم شوند.
 - **دسترسی‌ها:** `AmazonBedrockFullAccess` در کد فعلی استفاده نمی‌شود و می‌توان آن را برداشت.
+- **بارگذاری اول در نسخه PDF:** در اولین سوال بعد از هر شروع سرد (cold start)، همه PDFها دانلود و پردازش می‌شوند. اگر حجم جزوه‌ها زیاد باشد، ممکن است از Timeout یک‌دقیقه‌ای بگذرد. در این حالت Timeout را بالاتر ببرید یا متن را یک بار استخراج و در JSON ذخیره کنید.
+- **کش نیمه‌کاره:** اگر هنگام خواندن PDFها خطا رخ دهد، فهرست ناقص در حافظه می‌ماند و تا شروع سرد بعدی تغییر نمی‌کند. برای رفع فوری می‌توانید یک تغییر کوچک در تنظیمات تابع بدهید و ذخیره کنید.
+- **PDF جدید:** بعد از آپلود فایل تازه، تا وقتی محیط اجرای Lambda زنده است، کش قدیمی استفاده می‌شود.
+- **کیفیت متن فارسی:** `pypdf` روی بعضی PDFهای فارسی ترتیب کلمات یا حروف را به‌هم می‌ریزد. PDFهای اسکن‌شده هم متن ندارند و صفحه‌هایی که کمتر از ۵۰ کاراکتر متن داشته باشند حذف می‌شوند.
+- **سقف لیست Bucket:** تابع `list_objects_v2` در هر بار حداکثر ۱۰۰۰ فایل برمی‌گرداند که برای جزوه‌های یک درس کافی است.
